@@ -139,6 +139,62 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Walkthrough wiki: the data-driven breadboard player
+  if (url.pathname === '/wiki' || url.pathname === '/wiki.html') {
+    serveFile(res, path.join(CLIENT, 'wiki.html'));
+    return;
+  }
+
+  // Walkthrough wiki chapter data + generated index
+  if (url.pathname === '/wiki/index.json') {
+    try {
+      const { compileWiki } = require(path.join(__dirname, '..', 'wiki', 'meta-compile.js'));
+      const result = compileWiki();
+      if (!result.ok) throw new Error(result.errors.join('; '));
+      send(res, 200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-cache' },
+        JSON.stringify({ index: result.bundle.index, centroid: result.bundle.centroid, tally: result.bundle.tally }, null, 2));
+    } catch (err) {
+      send(res, 500, { 'Content-Type': 'application/json' }, JSON.stringify({ ok: false, error: String(err.message || err) }));
+    }
+    return;
+  }
+  if (url.pathname.startsWith('/wiki/chapters/')) {
+    const safe = path.normalize(url.pathname).replace(/^(\.\.[/\\])+/, '');
+    const filePath = path.join(ROOT, safe);
+    if (!filePath.startsWith(path.join(ROOT, 'wiki', 'chapters'))) {
+      send(res, 403, { 'Content-Type': 'text/plain' }, 'Forbidden');
+      return;
+    }
+    serveFile(res, filePath);
+    return;
+  }
+  if (url.pathname === '/api/wiki') {
+    try {
+      const { compileWiki } = require(path.join(__dirname, '..', 'wiki', 'meta-compile.js'));
+      const result = compileWiki();
+      if (!result.ok) {
+        send(res, 500, { 'Content-Type': 'application/json' }, JSON.stringify({ ok: false, errors: result.errors }));
+        return;
+      }
+      const body = JSON.stringify({
+        ok: true,
+        name: result.bundle.name,
+        version: result.bundle.version,
+        index: result.bundle.index,
+        tally: result.bundle.tally,
+        faces: result.bundle.faces,
+        centroid: result.bundle.centroid,
+        vtt: result.bundle.vtt,
+        digest: result.bundle.digest,
+        chapters: result.bundle.chapters
+      }, null, 2);
+      send(res, 200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-cache' }, body);
+    } catch (err) {
+      send(res, 500, { 'Content-Type': 'application/json' }, JSON.stringify({ ok: false, error: String(err.message || err) }));
+    }
+    return;
+  }
+
   // Docs (markdown as text/markdown)
   if (url.pathname.startsWith('/docs/')) {
     const safe = path.normalize(url.pathname).replace(/^(\.\.[/\\])+/, '');
@@ -188,7 +244,7 @@ const server = http.createServer((req, res) => {
       const readSafe = (rel) => {
         try { return fs.readFileSync(path.join(ROOT, rel), 'utf8'); } catch (_) { return null; }
       };
-      const clientFiles = ['bootstrap.html', 'adopt.html', 'genesis.html', 'genesis-fold.html', 'genesis-interactive.js', 'webgl-renderer.js', 'webaudio-renderer.js', 'texttrack-attach.js', 'dom-stack.js', 'svg-worker.js'];
+      const clientFiles = ['bootstrap.html', 'adopt.html', 'genesis.html', 'genesis-fold.html', 'wiki.html', 'wiki.js', 'genesis-interactive.js', 'webgl-renderer.js', 'webaudio-renderer.js', 'texttrack-attach.js', 'dom-stack.js', 'svg-worker.js'];
       const sharedFiles = [
         'pattern-pipeline.js', 'plugin-api.js', 'ruler.js', 'dimension-pipeline.js',
         'constraint-pipeline.js', 'regex-constraints.js', 'solid-toolkit.js',
@@ -212,9 +268,30 @@ const server = http.createServer((req, res) => {
         license: 'CC0-1.0',
         generatedAt: new Date().toISOString(),
         genesisChapters: 23,
-        routes: ['/', '/adopt', '/genesis', '/api/pipeline', '/api/bundle'],
+        routes: ['/', '/adopt', '/genesis', '/api/pipeline', '/api/bundle', '/wiki', '/api/wiki'],
         client,
         shared,
+        wiki: (() => {
+          try {
+            const { compileWiki } = require(path.join(__dirname, '..', 'wiki', 'meta-compile.js'));
+            const result = compileWiki();
+            if (!result.ok) return { ok: false, errors: result.errors };
+            return {
+              ok: true,
+              name: result.bundle.name,
+              version: result.bundle.version,
+              index: result.bundle.index,
+              streamComplete: result.bundle.streamComplete,
+              vtt: result.bundle.vtt,
+              tally: result.bundle.tally,
+              faces: result.bundle.faces,
+              centroid: result.bundle.centroid,
+              digest: result.bundle.digest
+            };
+          } catch (_) {
+            return { ok: false };
+          }
+        })(),
         docs: {
           'GENESIS.md': readSafe(path.join('docs', 'GENESIS.md')),
           'BOOTSTRAP.md': readSafe(path.join('docs', 'BOOTSTRAP.md')),
