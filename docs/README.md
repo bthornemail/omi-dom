@@ -26,6 +26,7 @@ node server/server.js
 | `/docs/README.md` | This document |
 | `/docs/GENESIS.md` | Genesis narrative |
 | `/docs/BOOTSTRAP.md` | Adopt · Participate · Extend |
+| `/docs/MODEL.md` | Four-Vertex Model · verified invariants · `model/` tree language |
 
 ```js
 const { runPatternPipeline } = require('./shared/pattern-pipeline');

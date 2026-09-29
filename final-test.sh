@@ -14,7 +14,7 @@ echo "OK server syntax"
 # Self-tests (sync modules)
 for m in ruler clock-sliderule hit-zones-cues dimension-pipeline busybox ascii-table \
   solid-toolkit solid-toolkit-extended solid-to-triple edge-ngram spatial-gnn \
-  contrasting-orchestrator pattern-pipeline plugin-api hardware-ref; do
+  contrasting-orchestrator pattern-pipeline plugin-api hardware-ref blob-substrate prolog-resolve fano-lottery algorithmic-core path-protocol space peers declare; do
   if node -e "const r=require('./shared/$m').selfTest(); if(!r.passed) process.exit(1)" 2>/dev/null; then
     echo "OK selfTest $m"
   else
@@ -48,7 +48,8 @@ cleanup() { kill $SPID 2>/dev/null || true; }
 trap cleanup EXIT
 
 for path in / /adopt /genesis /genesis-fold /api/pipeline /api/bundle /docs/README.md \
-  /wiki /api/wiki /wiki/index.json /wiki/chapters/cn-02-apply-6t.json /wiki/chapters/cn-04-digest-10t.json; do
+  /wiki /api/wiki /wiki/index.json /wiki/chapters/cn-02-apply-6t.json /wiki/chapters/cn-04-digest-10t.json \
+  /api/substrate /universe /devtools /agent /agent/world /api/cues; do
   code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${PORT}${path}" || echo 000)
   if [ "$code" = "200" ]; then
     echo "OK HTTP $path → $code"

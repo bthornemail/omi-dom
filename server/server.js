@@ -17,6 +17,27 @@ const { URL } = require('url');
 const PORT = process.env.PORT || 8742;
 const ROOT = path.resolve(__dirname, '..');
 const CLIENT = path.join(ROOT, 'client');
+const AGENT = path.join(ROOT, 'agent');
+const DATA_DIR = path.join(ROOT, 'data');
+const SUBSTRATE_FILE = path.join(DATA_DIR, 'substrate.json');
+
+// Canonical substrate: the single shared data volume every terminal joins.
+// Epoch advances only via Atomics.compareExchange (the delta law). Persisted
+// to disk on change so the simulation lives across restarts — the delta keeps
+// counting from where it left off, driven entirely by the atomic kernel.
+let substrate = null;
+let SUBSTRATE = null;
+try {
+  substrate = require('../shared/blob-substrate');
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  SUBSTRATE = substrate.bind();
+} catch (e) {
+  console.error('[substrate] unavailable:', e.message);
+}
+let fanoLottery = null;
+try { fanoLottery = require('../shared/fano-lottery'); } catch (e) {
+  console.error('[fano] unavailable:', e.message);
+}
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -58,6 +79,70 @@ function serveFile(res, filePath) {
   });
 }
 
+// ---------- Substrate persistence (delta-only, no time) ----------
+
+let persistTimer = null;
+
+function persistSubstrate() {
+  if (!SUBSTRATE) return;
+  try {
+    const { view, shared } = SUBSTRATE;
+    const snap = substrate.snapshotJSON(view, shared);
+    const json = JSON.stringify(snap);
+    fs.writeFileSync(path.join(DATA_DIR, 'substrate.json.tmp'), json);
+    fs.renameSync(path.join(DATA_DIR, 'substrate.json.tmp'), SUBSTRATE_FILE);
+  } catch (e) {
+    console.error('[substrate] persist error:', e.message);
+  }
+}
+
+function loadSubstrate() {
+  if (!SUBSTRATE) return;
+  try {
+    if (!fs.existsSync(SUBSTRATE_FILE)) {
+      persistSubstrate();
+      return;
+    }
+    const snap = JSON.parse(fs.readFileSync(SUBSTRATE_FILE, 'utf8'));
+    if (!snap || !Array.isArray(snap.slots)) return;
+    const { view, shared } = SUBSTRATE;
+    substrate.restore(SUBSTRATE, view, shared, snap, { force: true });
+    console.log(`[substrate] restored ${snap.slots.length} slots, epoch=${snap.epoch}`);
+  } catch (e) {
+    console.error('[substrate] load error:', e.message);
+  }
+}
+
+function persistAndReturn(snapshot) {
+  persistSubstrate();
+  return snapshot;
+}
+
+loadSubstrate();
+
+if (SUBSTRATE) {
+  // Period: persist every 32 deltas. Not a timed clock — the delta drives it.
+  const { view, shared } = SUBSTRATE;
+  const lastPersistEpochRef = { epoch: substrate.centroid(view, shared).epoch };
+  if (!persistTimer) {
+    persistTimer = setInterval(() => {
+      const e = substrate.centroid(view, shared).epoch;
+      if (e - lastPersistEpochRef.epoch >= 32) {
+        lastPersistEpochRef.epoch = e;
+        persistSubstrate();
+      }
+    }, 1000);
+  }
+  process.on('SIGINT', () => {
+    persistSubstrate();
+    process.exit(0);
+  });
+  process.on('SIGTERM', () => {
+    persistSubstrate();
+    process.exit(0);
+  });
+}
+
 function handleSSE(req, res) {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
@@ -71,18 +156,30 @@ function handleSSE(req, res) {
   res.write(': OMI-IMO SSE stream\n');
   res.write('retry: 3000\n\n');
 
-  let tick = 0;
+  let n = 0;
+  // Each SSE impulse advances the shared epoch by one delta. There is no
+  // analog clock here: the heartbeat IS a delta applied to the substrate.
   const timer = setInterval(() => {
-    tick++;
+    n++;
+    let e = 0, fold = -1;
+    if (SUBSTRATE) {
+      e = substrate.delta(SUBSTRATE, SUBSTRATE.view, SUBSTRATE.shared, 1);
+      fold = substrate.centroid(SUBSTRATE.view, SUBSTRATE.shared).fold;
+    }
+    const tk = substrate ? substrate.token(`t${e}`, `substrate`) : null;
     const payload = JSON.stringify({
-      tick,
-      t: Date.now(),
+      delta: n,
+      epoch: e,
+      foldHex: fold < 0 ? null : `0x${(fold >>> 0).toString(16).padStart(4, '0')}`,
+      coord: tk ? tk.coord : null,
       layer: 'carrier',
-      msg: 'heartbeat'
+      msg: 'delta'
     });
-    res.write(`id: ${tick}\n`);
+    res.write(`id: ${e}\n`);
     res.write(`event: omi\n`);
     res.write(`data: ${payload}\n\n`);
+    // Snapshot every 32 deltas so persistence and observability share a cadence.
+    if (SUBSTRATE && (n % 32 === 0)) persistSubstrate();
   }, 2000);
 
   req.on('close', () => {
@@ -94,9 +191,21 @@ const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const accept = req.headers.accept || '';
 
-  // CORS for local experimentation
+  // CORS + cross-origin isolation for local experimentation.
+  // COOP+COEP make crossOriginIsolated === true so every terminal can hold
+  // the SAME SharedArrayBuffer and contend on the same Atomics.compareExchange.
+  // This is the entire shared-universe gate; without it browsers throw on SAB.
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Accept, Content-Type');
+
+  // Isolation handshake used by the client: report crossOriginIsolated + SAB
+  if (url.pathname === '/isolation' && req.method !== 'OPTIONS') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end('<html>ok</html>');
+    return;
+  }
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
@@ -142,6 +251,161 @@ const server = http.createServer((req, res) => {
   // Walkthrough wiki: the data-driven breadboard player
   if (url.pathname === '/wiki' || url.pathname === '/wiki.html') {
     serveFile(res, path.join(CLIENT, 'wiki.html'));
+    return;
+  }
+
+  // Living universe: popup book + Steiner cone lattice
+  if (url.pathname === '/universe' || url.pathname === '/universe.html') {
+    serveFile(res, path.join(CLIENT, 'universe.html'));
+    return;
+  }
+
+  // DevTools for media: the protocol's UI (inspect/decompose/modify/recompose)
+  if (url.pathname === '/devtools' || url.pathname === '/devtools.html') {
+    serveFile(res, path.join(CLIENT, 'devtools.html'));
+    return;
+  }
+
+  // Transistor circuit: the four XOR realizations (5T/6T/8T/10T) as Web Audio
+  // graphs — carrier oscillators gated by transistors (gain), placed in the
+  // stereo field (StereoPanner), read by the spectrometer (AnalyserNode).
+  if (url.pathname === '/agent' || url.pathname === '/agent.html') {
+    serveFile(res, path.join(AGENT, 'transistor-circuit.html'));
+    return;
+  }
+
+  // Agent world: the four agent rods on the Steiner lattice (epoch-driven)
+  if (url.pathname === '/agent/world' || url.pathname === '/agent/world.html') {
+    serveFile(res, path.join(AGENT, 'world.html'));
+    return;
+  }
+
+  if (url.pathname === '/agent/transistor-circuit.html' || url.pathname === '/agent/transistor-circuit.js' ||
+      url.pathname === '/agent/world.html' || url.pathname === '/agent/world.js') {
+    serveFile(res, path.join(AGENT, path.basename(url.pathname)));
+    return;
+  }
+
+  // Popup-book cues: VTT-track facts bound via media queries. Each POST runs
+  // the Fano-plane lottery: up to 14 cycles to wire the fact to a recognized
+  // media channel (screen/print today, more as the lattice grows) or report
+  // it is not allocatable.
+  const CUES_FILE = path.join(DATA_DIR, 'cues.json');
+  if (url.pathname === '/api/cues') {
+    if (req.method === 'GET') {
+      let cues = [];
+      try { cues = JSON.parse(fs.readFileSync(CUES_FILE, 'utf8')); } catch (_) {}
+      send(res, 200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-cache' },
+        JSON.stringify({ ok: true, count: cues.length, cues }));
+      return;
+    }
+    if (req.method === 'POST') {
+      let body = '';
+      req.on('data', (chunk) => { body += chunk; });
+      req.on('end', () => {
+        let body2 = {};
+        try { body2 = JSON.parse(body || '{}'); } catch (_) {}
+        body2 = {
+          name: String(body2.name || 'fact'),
+          media: String(body2.media || ''),
+          text: String(body2.text || 'xor')
+        };
+
+        let e = 0, alloc = null;
+        if (substrate && SUBSTRATE) {
+          e = substrate.delta(SUBSTRATE, SUBSTRATE.view, SUBSTRATE.shared, 1); // each bind = 1 delta
+          if (fanoLottery) {
+            const day = Math.floor(substrate.centroid(SUBSTRATE.view, SUBSTRATE.shared).epoch / 16);
+            // live wires grow ~1 point/day from the 2 today: min(7, 2 + day/7)
+            const liveCount = Math.min(7, 2 + Math.floor(day / 7));
+            alloc = fanoLottery.allocate({ name: body2.name, text: body2.text, day, liveCount });
+          }
+        } else {
+          e = (Date.now() % 1000000) | 0;
+        }
+
+        const cue = {
+          id: e,
+          name: body2.name,
+          media: body2.media || (alloc && alloc.allocatable && alloc.media) || 'all',
+          text: body2.text,
+          lottery: alloc ? {
+            allocatable: alloc.allocatable,
+            cycles: alloc.cycles,
+            point: alloc.point,
+            media: alloc.media,
+            line: alloc.line,
+            live: alloc.live,
+            note: alloc.note
+          } : null
+        };
+        let cues = [];
+        try { cues = JSON.parse(fs.readFileSync(CUES_FILE, 'utf8')); } catch (_) {}
+        cues.push(cue);
+        if (cues.length > 720) cues.splice(0, cues.length - 720); // shed weight, keep balance
+        fs.writeFileSync(CUES_FILE, JSON.stringify(cues, null, 2));
+        const c = substrate && SUBSTRATE ? substrate.centroid(SUBSTRATE.view, SUBSTRATE.shared).epoch : e;
+        send(res, 200, { 'Content-Type': 'application/json; charset=utf-8' },
+          JSON.stringify({ ok: true, cue, epoch: c }));
+      });
+      return;
+    }
+    send(res, 405, { 'Content-Type': 'text/plain' }, 'Method Not Allowed');
+    return;
+  }
+
+  // Substrate: the shared living data volume (join / delta / reconcile).
+  if (url.pathname === '/api/substrate' && SUBSTRATE) {
+    const { view, shared } = SUBSTRATE;
+    const c = substrate.centroid(view, shared);
+    if (req.method === 'GET') {
+      const snap = substrate.snapshotJSON(view, shared);
+      const payload = {
+        ok: true,
+        epoch: c.epoch,
+        foldHex: `0x${(c.fold >>> 0).toString(16).padStart(4, '0')}`,
+        sealed: c.fold === 0,
+        vertices: [0, 1, 2, 3].map((i) => substrate.vertex(view, i, shared)),
+        centroid: c,
+        slots: snap.slots,
+        version: snap.version,
+        bytes: snap.bytes
+      };
+      send(res, 200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-cache' },
+        JSON.stringify(payload));
+      return;
+    }
+    if (req.method === 'POST') {
+      let body = '';
+      req.on('data', (chunk) => { body += chunk; });
+      req.on('end', () => {
+        let action = 'delta', remoteEpoch = -1;
+        try {
+          const parsed = JSON.parse(body || '{}');
+          action = parsed.action || 'delta';
+          remoteEpoch = Number.isInteger(parsed.epoch) ? parsed.epoch : -1;
+        } catch (_) { action = 'delta'; }
+        if (action === 'delta') {
+          const e = substrate.delta(SUBSTRATE, view, shared, 1);
+          const snap = substrate.snapshotJSON(view, shared);
+          send(res, 200, { 'Content-Type': 'application/json; charset=utf-8' },
+            JSON.stringify({ ok: true, action: 'delta', epoch: e, sealed: snap.sealed }));
+          return;
+        }
+        if (action === 'reconcile') {
+          const local = { epoch: c.epoch, utc: Date.now() };
+          const remote = { epoch: remoteEpoch >= 0 ? remoteEpoch : 0, utc: 0 };
+          const rec = substrate.reconcile(SUBSTRATE, view, shared, local, remote);
+          const snap = substrate.snapshotJSON(view, shared);
+          send(res, 200, { 'Content-Type': 'application/json; charset=utf-8' },
+            JSON.stringify({ ok: true, action: 'reconcile', ...rec, sealed: snap.sealed }));
+          return;
+        }
+        send(res, 400, { 'Content-Type': 'application/json' }, JSON.stringify({ ok: false, error: `unknown action ${action}` }));
+      });
+      return;
+    }
+    send(res, 405, { 'Content-Type': 'text/plain' }, 'Method Not Allowed');
     return;
   }
 
@@ -244,18 +508,26 @@ const server = http.createServer((req, res) => {
       const readSafe = (rel) => {
         try { return fs.readFileSync(path.join(ROOT, rel), 'utf8'); } catch (_) { return null; }
       };
-      const clientFiles = ['bootstrap.html', 'adopt.html', 'genesis.html', 'genesis-fold.html', 'wiki.html', 'wiki.js', 'genesis-interactive.js', 'webgl-renderer.js', 'webaudio-renderer.js', 'texttrack-attach.js', 'dom-stack.js', 'svg-worker.js'];
+      const clientFiles = ['bootstrap.html', 'adopt.html', 'genesis.html', 'genesis-fold.html', 'wiki.html', 'wiki.js', 'genesis-interactive.js', 'webgl-renderer.js', 'webaudio-renderer.js', 'texttrack-attach.js', 'dom-stack.js', 'svg-worker.js', 'universe.html', 'universe.js', 'devtools.html', 'devtools.js', 'portal.html', 'portal.js'];
+      const agentFiles = ['transistor-circuit.html', 'transistor-circuit.js', 'world.html', 'world.js'];
       const sharedFiles = [
         'pattern-pipeline.js', 'plugin-api.js', 'ruler.js', 'dimension-pipeline.js',
         'constraint-pipeline.js', 'regex-constraints.js', 'solid-toolkit.js',
         'solid-toolkit-extended.js', 'solid-to-triple.js', 'edge-ngram.js',
         'spatial-gnn.js', 'contrasting-orchestrator.js', 'clock-sliderule.js',
-        'hit-zones-cues.js', 'busybox.js', 'parallel-engine.js', 'ascii-table.js'
+        'hit-zones-cues.js', 'busybox.js', 'parallel-engine.js', 'ascii-table.js',
+        'algorithmic-core.js', 'blob-substrate.js', 'fano-lottery.js', 'path-protocol.js',
+        'space.js', 'peers.js', 'declare.js'
       ];
       const client = {};
       for (const f of clientFiles) {
         const c = readSafe(path.join('client', f));
         if (c != null) client[f] = c;
+      }
+      const agent = {};
+      for (const f of agentFiles) {
+        const c = readSafe(path.join('agent', f));
+        if (c != null) agent[f] = c;
       }
       const shared = {};
       for (const f of sharedFiles) {
@@ -268,8 +540,9 @@ const server = http.createServer((req, res) => {
         license: 'CC0-1.0',
         generatedAt: new Date().toISOString(),
         genesisChapters: 23,
-        routes: ['/', '/adopt', '/genesis', '/api/pipeline', '/api/bundle', '/wiki', '/api/wiki'],
+        routes: ['/', '/adopt', '/genesis', '/api/pipeline', '/api/bundle', '/wiki', '/api/wiki', '/api/substrate', '/events', '/universe', '/devtools', '/agent', '/api/cues', '/isolation'],
         client,
+        agent,
         shared,
         wiki: (() => {
           try {
@@ -297,6 +570,19 @@ const server = http.createServer((req, res) => {
           'BOOTSTRAP.md': readSafe(path.join('docs', 'BOOTSTRAP.md')),
           'README.md': readSafe(path.join('docs', 'README.md'))
         },
+        substrate: SUBSTRATE
+          ? (() => {
+              const { view, shared } = SUBSTRATE;
+              const c = substrate.centroid(view, shared);
+              return {
+                ok: true,
+                bytes: substrate.BLOB_BYTES,
+                epoch: c.epoch,
+                foldHex: `0x${(c.fold >>> 0).toString(16).padStart(4, '0')}`,
+                sealed: c.fold === 0
+              };
+            })()
+          : { ok: false },
         note: 'Share or unpack client/ + shared/ sources. Run with Node >=16: node server/server.js after restoring server.js from the repo or rebuilding.'
       };
       const body = JSON.stringify(bundle, null, 2);

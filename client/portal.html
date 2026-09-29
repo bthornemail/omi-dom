@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agreement — the closest thing to truth</title>
+<style>
+  :root {
+    --bg: #08080a;
+    --panel: #101014;
+    --line: #1e1e26;
+    --ink: #d8d8e0;
+    --dim: #6a6a78;
+    --ok: #4ade80;
+    --warn: #fbbf24;
+    --bad: #f87171;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: var(--mono); font-size: 14px; line-height: 1.5;
+    padding: 32px 20px 80px;
+  }
+  .wrap { max-width: 1000px; margin: 0 auto; }
+  h1 { font-size: 15px; font-weight: 500; letter-spacing: .02em; margin: 0 0 4px; }
+  .tagline { color: var(--ink); font-size: 26px; line-height: 1.25; margin: 0 0 6px; letter-spacing: -.01em; }
+  .tagline em { color: var(--ok); font-style: normal; }
+  .sub { color: var(--dim); font-size: 13px; margin: 0 0 28px; max-width: 62ch; }
+
+  .peers { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .peer { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+  .peer.off { opacity: .5; border-style: dashed; }
+  .peer h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .12em; color: var(--dim); margin: 0 0 10px; display: flex; justify-content: space-between; align-items: center; }
+  .word { font-size: 30px; letter-spacing: .06em; margin: 0 0 12px; }
+  .bytes { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; margin-bottom: 12px; }
+  .byte { background: #0c0c10; border: 1px solid var(--line); border-radius: 4px; padding: 5px 2px; text-align: center; font-size: 12px; }
+  .byte.hot { border-color: var(--bad); color: var(--bad); }
+  input[type=text] { background: #0c0c10; border: 1px solid var(--line); color: var(--ink); font-family: var(--mono); font-size: 13px; padding: 5px 8px; border-radius: 4px; width: 130px; }
+  input[type=text]:focus { outline: none; border-color: var(--dim); }
+  label.sw { display: inline-flex; align-items: center; gap: 5px; color: var(--dim); font-size: 12px; cursor: pointer; user-select: none; }
+
+  .xor { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin: 14px 0; }
+  .xor.agreed { border-color: #1d3a26; }
+  .dist { font-size: 44px; letter-spacing: -.02em; line-height: 1.1; }
+  .dist.agreed { color: var(--ok); }
+  .dist.diverged { color: var(--warn); }
+  .xorlabel { color: var(--dim); font-size: 12px; text-transform: uppercase; letter-spacing: .12em; }
+  .detail { color: var(--dim); font-size: 12px; margin-top: 6px; }
+
+  .controls { display: flex; gap: 7px; flex-wrap: wrap; margin: 14px 0 26px; }
+  button {
+    background: #15151b; border: 1px solid var(--line); color: var(--ink);
+    font-family: var(--mono); font-size: 12px; letter-spacing: .06em; text-transform: uppercase;
+    padding: 8px 14px; border-radius: 5px; cursor: pointer;
+  }
+  button:hover { border-color: var(--dim); }
+  button.go { border-color: #2f4a37; color: var(--ok); }
+  button.go:hover { background: #14201a; }
+
+  .sec { border-top: 1px solid var(--line); margin-top: 30px; padding-top: 18px; }
+  .sec h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .12em; color: var(--dim); margin: 0 0 10px; font-weight: 500; }
+  textarea {
+    width: 100%; background: #0c0c10; border: 1px solid var(--line); color: var(--ink);
+    font-family: var(--mono); font-size: 13px; line-height: 1.6; padding: 12px; border-radius: 6px;
+    resize: vertical; min-height: 190px;
+  }
+  textarea:focus { outline: none; border-color: var(--dim); }
+  .log { background: #0c0c10; border: 1px solid var(--line); border-radius: 6px; padding: 12px; margin-top: 10px; font-size: 12px; max-height: 300px; overflow: auto; }
+  .log div { white-space: pre-wrap; word-break: break-word; }
+  .log .ln { color: var(--dim); }
+  .log .ok { color: var(--ok); }
+  .log .warn { color: var(--warn); }
+  .log .bad { color: var(--bad); }
+
+  .note { color: var(--dim); font-size: 12px; max-width: 70ch; margin-top: 8px; }
+  .note b { color: var(--ink); font-weight: 500; }
+  .mode { color: var(--dim); font-size: 11px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>omi-imo / agreement</h1>
+  <p class="tagline">Agreement is the <em>closest thing to truth.</em></p>
+  <p class="sub">
+    Two peers. No server, no clock, no authority, no merge function.
+    One XOR says how far apart they are and exactly where. One more XOR puts them
+    back together — because the distance and the displacement are the same object.
+  </p>
+
+  <div class="peers">
+    <div class="peer" id="pA">
+      <h2>alice <span class="mode" id="mA"></span></h2>
+      <div class="word" id="wA">0x00000000</div>
+      <div class="bytes" id="bA"></div>
+      <input type="text" id="eA" value="0x00000000" spellcheck="false">
+      <label class="sw"><input type="checkbox" id="offA"> offline</label>
+    </div>
+    <div class="peer" id="pB">
+      <h2>bob <span class="mode" id="mB"></span></h2>
+      <div class="word" id="wB">0x00000000</div>
+      <div class="bytes" id="bB"></div>
+      <input type="text" id="eB" value="0x00000000" spellcheck="false">
+      <label class="sw"><input type="checkbox" id="offB"> offline</label>
+    </div>
+  </div>
+
+  <div class="xor" id="xorBox">
+    <div class="xorlabel">distance — popcount(alice XOR bob)</div>
+    <div class="dist agreed" id="dist">0</div>
+    <div class="detail" id="detail">identical</div>
+  </div>
+
+  <div class="controls">
+    <button class="go" id="btnRead">read — xor</button>
+    <button class="go" id="btnRoll">roll back</button>
+    <button id="btnWitness">witness</button>
+    <button id="btnBind">bind — 0, 2, 1</button>
+    <button id="btnSplit">split them</button>
+    <button id="btnReset">reset</button>
+  </div>
+
+  <div class="sec">
+    <h3>declarative syntax</h3>
+    <textarea id="src" spellcheck="false"></textarea>
+    <div class="controls">
+      <button class="go" id="btnRun">run</button>
+      <button id="btnDemo">load the offline demo</button>
+    </div>
+    <div class="log" id="log"></div>
+  </div>
+
+  <div class="sec">
+    <h3>what this is, precisely</h3>
+    <p class="note">
+      <b>It is:</b> detection and repair of divergence with no coordination.
+      <span class="mode" id="modeLine"></span>
+    </p>
+    <p class="note">
+      <b>It is not:</b> a clock. XOR is commutative, so <code>a ^ b == b ^ a</code> —
+      it measures the <i>magnitude</i> of a difference and never the <i>order</i> of
+      two concurrent edits. It does not replace vector clocks and cannot tell you
+      which edit came first. The narrow claim is the true one: clocks exist to order
+      events, and if all you need is how far apart two states are and how to undo the
+      difference, you need no clock at all.
+    </p>
+    <p class="note">
+      <b>Also:</b> <code>a ^ a == 0</code> for any <code>a</code>, anywhere, in any base.
+      That is a logical truth, not a measurement, which is why it is the only thing here
+      that is genuinely invariant.
+    </p>
+  </div>
+
+</div>
+<script src="/client/portal.js"></script>
+</body>
+</html>
