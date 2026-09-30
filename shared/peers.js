@@ -93,10 +93,16 @@ function createPeer(opts) {
     return shared ? Atomics.load(view, i) : view[i];
   }
 
-  // The witness is the XOR-fold of everything this peer has ever published. It
-  // is the tamper tripwire: state can be quietly rewritten behind the API, but
-  // then the fold no longer matches and the tampering shows.
-  const history = { fold: 0, steps: 0 };
+  // The witness. `attested` is the last state that came through a sanctioned
+  // write, and it is what makes tampering detectable: a quiet rewrite of the
+  // cell moves `state` and cannot move `attested`, so the two disagree.
+  //
+  // `fold` is kept separately as the XOR of everything ever published. It is a
+  // nice invariant to display, but it is NOT the tamper check: after two
+  // honest writes, fold = a ^ b, which is not the current state, and there is
+  // nothing wrong. Comparing state against fold would flag honest history as
+  // tampering, which makes the whole claim worthless.
+  const history = { fold: 0, attested: 0, steps: 0 };
 
   const peer = {
     name,
@@ -111,43 +117,52 @@ function createPeer(opts) {
     cas(i, expected, replacement) { return cas(i, expected, replacement); },
     load(i) { return load(i); },
 
+    // A sanctioned write: the atomic exchange AND the witness advance, together.
+    // Anything that legitimately changes state must use this, or the witness
+    // will (correctly) call it tampering.
+    applyCas(i, expected, replacement) {
+      const held = cas(i, expected, replacement);
+      if (held === expected) {
+        history.attested = replacement >>> 0;
+        history.fold = (history.fold ^ (replacement >>> 0)) >>> 0;
+        history.steps++;
+        return { ok: true, held, now: replacement >>> 0 };
+      }
+      return { ok: false, held, now: held };
+    },
+
     read() { return load(0); },
 
     // An honest write: CAS against what the peer believed was there, and the
-    // fold advances. Returns what the cell actually held.
+    // witness advances. Returns what the cell actually held.
     write(value) {
       const v = value >>> 0;
-      const held = cas(0, load(0), v);
-      history.fold = (history.fold ^ v) >>> 0;
-      history.steps++;
-      return held;
+      const r = this.applyCas(0, load(0), v);
+      return r.held;
     },
 
     // Force a value in with no expectation. Used to simulate an edit that did
-    // NOT come through write() — i.e. a peer that was tampered with, or one
-    // edited offline by an adversary. The witness will disagree afterwards.
+    // NOT come through a sanctioned write — i.e. a peer that was tampered with.
+    // The witness will disagree afterwards.
     tamper(value) {
       view[0] = value >>> 0;
       return value >>> 0;
     },
 
-    // Does the state still agree with everything the peer ever published?
+    // The tamper tripwire. `intact` is exact: it asks whether the current state
+    // is the one the peer last published through its own gate.
     witness() {
-      const expected = (history.fold ^ 0) >>> 0;
+      const state = load(0);
       return {
-        attested: history.fold === 0 || history.steps > 0,
         steps: history.steps,
+        state,
         fold: history.fold,
-        state: load(0),
-        // A single state cannot be checked against its own fold without a
-        // second reading, so the peer publishes the pair and the reader
-        // compares. A tampered peer fails the moment its fold moves off.
-        intact: true,
-        expected,
+        attested: history.attested,
+        intact: history.steps === 0 ? state === 0 : state === history.attested,
       };
     },
 
-    reset() { view[0] = 0; history.fold = 0; history.steps = 0; },
+    reset() { view[0] = 0; history.fold = 0; history.attested = 0; history.steps = 0; },
     offline: true,
   };
   return peer;
@@ -211,7 +226,10 @@ function repair(a, b, report) {
   if (d.agreed) return { moved: false, clobbered: false, report: d };
   for (let i = 0; i < d.saw.b.length; i++) {
     const target = ((d.saw.b[i] ^ d.cells[i].delta) >>> 0);
-    b.cas(i, d.saw.b[i], target);
+    // Through the peer's sanctioned gate, so a legitimate repair advances the
+    // witness. A repair that bypassed the gate would look exactly like a
+    // tamper, which is how the distinction gets blurred.
+    b.applyCas(i, d.saw.b[i], target);
   }
   const after = divergence(a, b);
   return {
@@ -251,17 +269,114 @@ function bind021(view, cas) {
   return { centre, hex: hex32(centre), classified: classify(centre), order: [0, 2, 1] };
 }
 
+// ---------------------------------------------------------------------------
+// Three peers. This is where the argument stops looking like a trick.
+// ---------------------------------------------------------------------------
+
+// With two peers you learn the MAGNITUDE of a disagreement. With three you also
+// learn WHICH peer is the odd one out, and it costs the same single XOR.
+//
+// If exactly one peer has diverged and the other two agree, then the XOR of all
+// three IS the outlier's value:
+//
+//     a = b = 5,  c = 9      5 ^ 5 ^ 9  =  9   =  c
+//     a = 5,  b = c = 9      5 ^ 9 ^ 9  =  5   =  a
+//
+// The identity of the dissenter falls out of the algebra. There is no vote, no
+// quorum, no coordinator, and nothing to elect.
+//
+// The precondition matters and is stated rather than assumed: this identifies an
+// outlier when exactly one peer is out. With two or three dissenters the fold is
+// no longer any single peer's value, and `outliers` reports that honestly rather
+// than picking a winner.
+//
+// Note also that `residue` is NOT the agreement test. Three copies of x fold to
+// x, not to 0, because three is odd. Agreement is measured by the pairwise
+// distances instead, which is 0 if and only if all three agree.
+function fold3(a, b, c) {
+  const values = { a: a.load(0), b: b.load(0), c: c.load(0) };
+  const residue = (values.a ^ values.b ^ values.c) >>> 0;
+
+  const ab = divergence(a, b);
+  const bc = divergence(b, c);
+  const ac = divergence(a, c);
+
+  // Majority by value, not a vote. With three peers a value held by two wins;
+  // three-way disagreement has no majority and we say so.
+  const tally = new Map();
+  for (const k of ['a', 'b', 'c']) {
+    tally.set(values[k], (tally.get(values[k]) || 0) + 1);
+  }
+  let majority = null;
+  let majorityCount = 0;
+  for (const [v, n] of tally) {
+    if (n > majorityCount) { majority = v; majorityCount = n; }
+  }
+  const hasMajority = majorityCount >= 2;
+  const outliers = hasMajority
+    ? ['a', 'b', 'c'].filter(k => values[k] !== majority)
+    : ['a', 'b', 'c'];
+
+  return {
+    values,
+    residue,
+    // The residue is the outlier's own value, exactly, when there is one
+    // outlier. Asserted in the self-test rather than claimed here.
+    residueIsOutlier: outliers.length === 1 && residue === values[outliers[0]],
+    outliers,
+    hasMajority,
+    majority,
+    majorityCount,
+    // Agreement is pairwise, because the fold cannot be zero for odd counts.
+    agreed: ab.agreed && bc.agreed && ac.agreed,
+    // A single scalar that is 0 if and only if all three agree.
+    disagreement: ab.popcount + bc.popcount + ac.popcount,
+    ab, bc, ac,
+  };
+}
+
+// Reconcile all three. Every peer that is not in the majority is rolled to the
+// majority value through its own sanctioned gate, so the witness advances and a
+// legitimate repair is never mistaken for a tamper.
+//
+// Pass the report the user was already shown, for the same reason repair() takes
+// one: they Read, they look at it, they click Roll, and in between a peer may
+// have moved. Checking against the report's own observation turns that into a
+// reported clobber instead of a silent overwrite.
+function reconcile3(a, b, c, report) {
+  const f = report || fold3(a, b, c);
+  if (f.agreed) return { moved: false, stalled: false, fold: f };
+  if (!f.hasMajority) return { moved: false, stalled: true, fold: f };
+  const byName = { a, b, c };
+  const target = f.majority;
+  for (const name of f.outliers) {
+    const p = byName[name];
+    p.applyCas(0, f.values[name], target);
+  }
+  const after = fold3(a, b, c);
+  return {
+    moved: after.agreed,
+    fold: f,
+    after,
+    // Still disagreeing, or no longer the same outlier set, means the exchange
+    // lost a race. Say so; do not claim a repair that did not happen.
+    stalled: !after.agreed,
+  };
+}
+
 module.exports = {
   WORD_BYTES,
   createBuffer,
   createPeer,
   divergence,
   repair,
+  reconcile3,
   classify,
   bind021,
   popcount,
   hex32,
   hasSAB,
+  fold3,
   selfTest,
 };
 
@@ -334,11 +449,29 @@ function selfTest() {
   const t = createPeer({ name: 'trudy', cells: 1 });
   t.write(0x11111111);
   const w1 = t.witness();
-  assert('an honest peer attests', w1.steps === 1 && w1.fold === 0x11111111);
+  assert('an honest peer attests', w1.steps === 1 && w1.intact === true && w1.state === 0x11111111);
   t.tamper(0x22222222);
   const w2 = t.witness();
-  assert('a tampered peer is caught: state moved, fold did not', w2.state === 0x22222222 && w2.fold === 0x11111111);
-  assert('the disagreement between state and fold is the tripwire', w2.state !== w2.fold);
+  assert('a tampered peer is caught: state moved, the attestation did not',
+    w2.state === 0x22222222 && w2.attested === 0x11111111 && w2.intact === false);
+  assert('the fold is NOT the tamper check, and must not be used as one', (function () {
+    // Two honest writes: fold is a^b, which is not the state, and nothing is
+    // wrong. Comparing state against fold would flag this as tampering.
+    const u = createPeer({ name: 'uma', cells: 1 });
+    u.write(7); u.write(3);
+    const w = u.witness();
+    return w.fold === (7 ^ 3) && w.fold !== w.state && w.intact === true;
+  })());
+  assert('a legitimate repair is witnessed, not mistaken for a tamper', (function () {
+    const x = createPeer({ name: 'x' }), y = createPeer({ name: 'y' });
+    x.write(0x0badf00d); y.write(0x00000003);
+    repair(x, y);
+    return divergence(x, y).agreed && y.witness().intact === true;
+  })());
+  assert('a fresh peer is intact at zero', (function () {
+    const z = createPeer({ name: 'z' });
+    return z.witness().intact === true && z.witness().steps === 0;
+  })());
 
   // --- 0, 2, 1
   assert('classify probes 0 first, then 2, then 1', classify(0) === 0 && classify(2) === 2 && classify(1) === 1 && classify(99) === 1);
@@ -354,6 +487,60 @@ function selfTest() {
   const dd = divergence(c, e);
   assert('a full 32-bit difference is distance 32', dd.popcount === 32);
   assert('all four bytes of the word are reported', dd.bytes.filter(x => x.cell === 0).length === 4);
+
+
+  // --- three peers: the residue IS the outlier
+  {
+    const a3 = createPeer({ name: 'a' }), b3 = createPeer({ name: 'b' }), c3 = createPeer({ name: 'c' });
+    a3.write(5); b3.write(5); c3.write(9);
+    const f = fold3(a3, b3, c3);
+    assert('three peers: not agreed', f.agreed === false && f.disagreement > 0);
+    assert('the outlier is identified as c', f.outliers.length === 1 && f.outliers[0] === 'c');
+    assert('the residue IS the outlier value, 5^5^9 === 9', f.residue === 9 && f.residueIsOutlier === true);
+    assert('the majority is 5, held by two', f.majority === 5 && f.majorityCount === 2);
+
+    const r3 = reconcile3(a3, b3, c3);
+    assert('reconcile brings all three to agreement', r3.moved === true && fold3(a3, b3, c3).agreed);
+    assert('a reconciled peer is not mistaken for a tamper',
+      c3.witness().intact === true && a3.witness().intact === true);
+  }
+  {
+    // the outlier does not have to be the last one
+    const a3 = createPeer({ name: 'a' }), b3 = createPeer({ name: 'b' }), c3 = createPeer({ name: 'c' });
+    a3.write(5); b3.write(9); c3.write(9);
+    const f = fold3(a3, b3, c3);
+    assert('the outlier is a, not c', f.outliers[0] === 'a' && f.residue === 5);
+  }
+  {
+    // all three agreeing: the fold is NOT zero, and must not be used as the test
+    const a3 = createPeer({ name: 'a' }), b3 = createPeer({ name: 'b' }), c3 = createPeer({ name: 'c' });
+    a3.write(0x1234); b3.write(0x1234); c3.write(0x1234);
+    const f = fold3(a3, b3, c3);
+    assert('three agreeing peers agree, even though the fold is nonzero',
+      f.agreed === true && f.residue === 0x1234 && f.disagreement === 0);
+    assert('agreement is measured pairwise, because three is odd',
+      f.agreed === true && f.residue !== 0);
+  }
+  {
+    // three-way disagreement: no majority, and we say so rather than picking one
+    const a3 = createPeer({ name: 'a' }), b3 = createPeer({ name: 'b' }), c3 = createPeer({ name: 'c' });
+    a3.write(1); b3.write(2); c3.write(4);
+    const f = fold3(a3, b3, c3);
+    assert('three-way disagreement has no majority', f.hasMajority === false && f.majorityCount === 1);
+    assert('no outlier is claimed when there is no majority', f.residueIsOutlier === false && f.outliers.length === 3);
+    assert('reconcile refuses rather than picking a winner',
+      reconcile3(a3, b3, c3).stalled === true);
+  }
+  {
+    // it composes with the clobber reporting
+    const a3 = createPeer({ name: 'a' }), b3 = createPeer({ name: 'b' }), c3 = createPeer({ name: 'c' });
+    a3.write(7); b3.write(7); c3.write(9);
+    const f = fold3(a3, b3, c3);
+    c3.tamper(3);
+    const r3 = reconcile3(a3, b3, c3, f);
+    assert('a stale three-peer report reports a clobber instead of lying',
+      r3.stalled === true && c3.read() === 3);
+  }
 
   const failed = results.filter(r2 => !r2.pass);
   return { passed: failed.length === 0, total: results.length, failed: failed.length, results };

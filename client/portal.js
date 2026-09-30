@@ -10,6 +10,10 @@
  * goes through Atomics.compareExchange inside peers.js. Nothing here holds a
  * copy of the truth; it only renders what the XOR says.
  *
+ * The first screen is the whole argument, in two clicks: "carol goes offline"
+ * and "roll back". The declarative panel is below it, because it is real but it
+ * is not the front door.
+ *
  * 'use strict';
  */
 
@@ -34,23 +38,31 @@
     return mod.exports;
   }
 
-  // ---- peers, wired
-  const peers = {};
-  let A = null, B = null;
-  let lastReport = null;
+  let P = null;   // shared/peers.js
+  let D = null;   // shared/declare.js
+  const A = { peer: null, id: 'a' };
+  const B = { peer: null, id: 'b' };
+  const C = { peer: null, id: 'c' };
+  let lastFold = null;
 
   const $ = (id) => document.getElementById(id);
-  const el = {
-    wA: $('wA'), wB: $('wB'), bA: $('bA'), bB: $('bB'),
-    eA: $('eA'), eB: $('eB'), offA: $('offA'), offB: $('offB'),
-    pA: $('pA'), pB: $('pB'), mA: $('mA'), mB: $('mB'),
-    dist: $('dist'), detail: $('detail'), xorBox: $('xorBox'),
-    src: $('src'), log: $('log'), modeLine: $('modeLine'),
-  };
+  const hex = (v) => '0x' + (v >>> 0).toString(16).toUpperCase().padStart(8, '0');
+  const el = {};
+  const slots = {};
 
-  const hex = peers.hex32 || ((v) => '0x' + (v >>> 0).toString(16).toUpperCase().padStart(8, '0'));
+  function bindSlots() {
+    const ids = ['A', 'B', 'C'];
+    ids.forEach((id, i) => {
+      const s = [A, B, C][i];
+      slots[id] = {
+        peerBox: $('p' + id), word: $('w' + id), bytes: $('b' + id),
+        input: $('e' + id), off: $('off' + id), mode: $('m' + id),
+      };
+      slots[id].tag = id === 'C' ? $('tC') : null;
+      s.slot = slots[id];
+    });
+  }
 
-  // A byte box, so a difference is visible as a *position*, not just a number.
   function byteBoxes(container, value, hot) {
     container.innerHTML = '';
     for (let k = 3; k >= 0; k--) {
@@ -62,33 +74,6 @@
     }
   }
 
-  function render() {
-    const a = A.read(), b = B.read();
-    el.wA.textContent = hex(a);
-    el.wB.textContent = hex(b);
-    const rep = peers.divergence(A, B);
-    const hotA = new Set(rep.bytes.map((x) => x.byte));
-    const hotB = new Set(rep.bytes.map((x) => x.byte));
-    byteBoxes(el.bA, a, rep.agreed ? null : hotA);
-    byteBoxes(el.bB, b, rep.agreed ? null : hotB);
-    el.pA.classList.toggle('off', !!A.offline);
-    el.pB.classList.toggle('off', !!B.offline);
-    el.mA.textContent = A.mode;
-    el.mB.textContent = B.mode;
-    el.dist.textContent = String(rep.popcount);
-    el.dist.className = 'dist ' + (rep.agreed ? 'agreed' : 'diverged');
-    el.xorBox.classList.toggle('agreed', rep.agreed);
-    if (rep.agreed) {
-      el.detail.textContent = 'agreement — xor is 0x00000000. the states are the same.';
-    } else {
-      const cells = rep.cells.map((c) => c.hex).join(' ');
-      el.detail.textContent = 'xor ' + cells + '  ·  ' + rep.popcount
-        + ' bit' + (rep.popcount === 1 ? '' : 's') + ' across '
-        + rep.bytes.length + ' byte' + (rep.bytes.length === 1 ? '' : 's')
-        + '  ·  ' + rep.cells_agreed + '/' + rep.cells_total + ' cells agree';
-    }
-  }
-
   function say(msg, cls) {
     const d = document.createElement('div');
     if (cls) d.className = cls;
@@ -96,9 +81,11 @@
     el.log.appendChild(d);
     el.log.scrollTop = el.log.scrollHeight;
   }
-
   function sayLine(n, tag, body, cls) {
     say('<span class="ln">' + String(n).padStart(2, '0') + '  ' + tag + '</span>  ' + body, cls);
+  }
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
   }
 
   function fromInput(peer, input) {
@@ -114,98 +101,149 @@
     return v >>> 0;
   }
 
-  // ---- actions. Every one of these is one operation, not a simulation.
-  function doRead() {
-    lastReport = peers.divergence(A, B);
-    render();
-    sayLine(0, 'read',
-      'xor ' + (lastReport.agreed ? '0x00000000' : hex(lastReport.fold))
-      + '  popcount ' + lastReport.popcount
-      + (lastReport.agreed ? '  <b>AGREEMENT</b>' : '  bytes differ at ' + lastReport.bytes.map((x) => x.byte).join(', ')),
-      lastReport.agreed ? 'ok' : 'warn');
-  }
+  // ---- render. The page only draws what the XOR says.
+  function render() {
+    const f = P.fold3(A.peer, B.peer, C.peer);
+    [A, B, C].forEach((s, i) => {
+      const id = ['A', 'B', 'C'][i];
+      const sl = slots[id];
+      const v = s.peer.read();
+      sl.word.textContent = hex(v);
+      const hot = new Set();
+      // any pairwise difference involving this peer marks the byte
+      [[A, B], [B, C], [A, C]].forEach(([x, y]) => {
+        if (x === s || y === s) {
+          P.divergence(x.peer, y.peer).bytes.forEach((d) => hot.add(d.byte));
+        }
+      });
+      byteBoxes(sl.bytes, v, hot.size ? hot : null);
+      sl.peerBox.classList.toggle('off', !!s.peer.offline);
+      sl.mode.textContent = s.peer.mode;
+      const isOut = !f.agreed && f.outliers.indexOf(s.id) !== -1;
+      sl.peerBox.classList.toggle('out', isOut);
+      if (sl.tag) {
+        sl.tag.className = 'tag' + (isOut ? ' out' : '');
+        sl.tag.textContent = isOut ? 'outlier' : '';
+      }
+    });
 
-  function doRoll() {
-    // Act on the report the user just looked at. If a peer moved in between,
-    // peers.js reports the clobber instead of pretending the repair happened.
-    const r = peers.repair(A, B, lastReport);
-    if (r.report.agreed) {
-      sayLine(0, 'roll', 'nothing to do — already agreeing', 'ok');
-    } else if (r.clobbered) {
-      sayLine(0, 'roll',
-        'clobbered: bob moved between the read and the roll (expected ' + hex(r.before)
-        + ', found ' + hex(r.after) + '). <b>not overwritten.</b>', 'bad');
+    el.num.textContent = String(f.disagreement);
+    el.num.className = 'num ' + (f.agreed ? 'agreed' : (f.hasMajority ? 'diverged' : 'stalled'));
+    el.readBox.classList.toggle('agreed', f.agreed);
+    el.readBox.classList.toggle('stalled', !f.agreed && !f.hasMajority);
+
+    if (f.agreed) {
+      el.outlier.className = 'outlier';
+      el.outlier.innerHTML = 'all three agree — every pairwise distance is 0. '
+        + '<span class="mode">the fold is not the test: three copies of x fold to x, not to 0, because three is odd.</span>';
+    } else if (!f.hasMajority) {
+      el.outlier.className = 'outlier hit';
+      el.outlier.innerHTML = '<b>no majority.</b> three different values, so there is nothing to roll toward. '
+        + 'refusing rather than picking a winner. residue ' + hex(f.residue) + '.';
     } else {
-      sayLine(0, 'roll',
-        'applied the displacement ' + hex(r.report.fold) + ' — bob ' + hex(r.before) + ' → ' + hex(r.after)
-        + '  ·  <b>AGREEMENT</b>', 'ok');
+      const who = f.outliers.length === 1 ? f.outliers[0] : f.outliers.join(', ');
+      const name = { a: 'alice', b: 'bob', c: 'carol' }[who] || who;
+      el.outlier.className = 'outlier hit';
+      el.outlier.innerHTML = f.residueIsOutlier
+        ? 'the outlier is <b>' + name + '</b> — and the fold <b>' + hex(f.residue) + '</b> <b>is</b> '
+          + name + '’s value. one XOR named the dissenter. no vote, no quorum.'
+        : 'majority is ' + hex(f.majority) + ' (held by ' + f.majorityCount + '); out: <b>' + name + '</b>.';
     }
-    lastReport = null;
-    render();
+    return f;
   }
 
-  function doWitness() {
-    const wa = A.witness(), wb = B.witness();
-    sayLine(0, 'witness', 'alice  state ' + hex(wa.state) + '  fold ' + hex(wa.fold) + '  steps ' + wa.steps
-      + (wa.state !== wa.fold && wa.steps ? '  <b>tampered</b>' : ''), wa.steps && wa.state !== wa.fold ? 'bad' : 'ok');
-    sayLine(0, 'witness', 'bob    state ' + hex(wb.state) + '  fold ' + hex(wb.fold) + '  steps ' + wb.steps
-      + (wb.state !== wb.fold && wb.steps ? '  <b>tampered</b>' : ''), wb.steps && wb.state !== wb.fold ? 'bad' : 'ok');
+  // ---- the two clicks.
+  function splitOne() {
+    // Alice and Bob stay in sync. Carol goes offline and edits. Two agree, one
+    // does not, so the fold IS the outlier.
+    C.peer.offline = true;
+    C.peer.write((C.peer.read() ^ 0x00000003) >>> 0);
+    slots.C.input.value = hex(C.peer.read());
+    C.peer.offline = false;
+    slots.C.off.checked = false;
+    lastFold = null;
+    const f = render();
+    sayLine(0, 'split', 'carol went offline and changed. alice and bob never moved. '
+      + 'carol is <b>' + hex(C.peer.read()) + '</b>.', 'warn');
+    if (f.residueIsOutlier) {
+      sayLine(0, 'read', 'residue ' + hex(f.residue) + ' — that is exactly carol’s value. '
+        + 'the outlier named itself, from one XOR.', 'warn');
+    }
+  }
+
+  function splitAll() {
+    // Three different values: no majority, and the honest answer is to refuse.
+    [[A, 0x11111111], [B, 0x22222222], [C, 0x44444444]].forEach(([s, v]) => {
+      s.peer.offline = true;
+      s.peer.write(v);
+      s.slot.input.value = hex(v);
+      s.peer.offline = false;
+      s.slot.off.checked = false;
+    });
+    lastFold = null;
+    render();
+    sayLine(0, 'split', 'all three changed, all differently. there is no majority, '
+      + 'so there is nothing to roll toward.', 'warn');
+    sayLine(0, 'read', 'refused. it will not pick a winner for you.', 'warn');
+  }
+
+  function roll() {
+    const r = P.reconcile3(A.peer, B.peer, C.peer, lastFold);
+    if (r.fold.agreed) {
+      sayLine(0, 'roll', 'nothing to do — already agreeing', 'ok');
+    } else if (r.stalled && !r.fold.hasMajority) {
+      sayLine(0, 'roll', 'refused: no majority. three-way disagreement cannot be repaired by XOR alone.', 'bad');
+    } else if (r.stalled) {
+      sayLine(0, 'roll', 'clobbered: a peer moved between the read and the roll. '
+        + '<b>not overwritten.</b>', 'bad');
+    } else {
+      const who = r.fold.outliers.join(', ');
+      sayLine(0, 'roll', 'rolled ' + who + ' to the majority ' + hex(r.fold.majority)
+        + ' — the displacement was already measured.  <b>AGREEMENT</b>', 'ok');
+    }
+    lastFold = null;
+    render();
   }
 
   function doBind() {
-    const f = peers.bind021(A.view);
-    sayLine(0, 'bind', '0, 2, 1 — three possibilities, extremes first.  centre ' + f.hex
-      + '  →  is this <b>' + f.classified + '</b>?  (0=origin, 2=offset, 1=unit)', 'ok');
-  }
-
-  function doSplit() {
-    // Go offline, edit both, come back. The whole point, in three actions.
-    A.offline = true; B.offline = true;
-    const va = fromInput(A, el.eA), vb = fromInput(B, el.eB);
-    if (va !== null) A.write(va);
-    if (vb !== null) B.write(vb);
-    // A plausible divergence: they each got a different value while apart.
-    A.write((A.read() ^ 0x0badf00d) >>> 0);
-    B.write((B.read() ^ 0x00000003) >>> 0);
-    el.eA.value = hex(A.read());
-    el.eB.value = hex(B.read());
-    A.offline = false; B.offline = false;
-    el.offA.checked = false; el.offB.checked = false;
-    lastReport = null;
-    render();
-    sayLine(0, 'split', 'both went offline and edited independently. now read, then roll.', 'warn');
+    const f = P.bind021(A.peer.view);
+    const what = { 0: 'the origin', 2: 'the offset', 1: 'the unit' }[f.classified];
+    el.bindOut.innerHTML = 'centre ' + f.hex + ' → <b>' + f.classified + '</b> — ' + what;
+    sayLine(0, 'bind', '0, 2, 1 — three possibilities, extremes first. centre ' + f.hex
+      + ' → is this <b>' + f.classified + '</b>? (' + what + ')', 'ok');
   }
 
   function doReset() {
-    A.reset(); B.reset();
-    el.eA.value = '0x00000000'; el.eB.value = '0x00000000';
-    el.offA.checked = false; el.offB.checked = false;
-    lastReport = null;
+    [A, B, C].forEach((s) => {
+      s.peer.reset();
+      s.peer.offline = false;
+      s.slot.input.value = '0x00000000';
+      s.slot.off.checked = false;
+    });
+    lastFold = null;
+    el.bindOut.innerHTML = '&nbsp;';
     render();
-    sayLine(0, 'reset', 'both peers zeroed.', 'ok');
+    sayLine(0, 'reset', 'all three zeroed.', 'ok');
   }
 
-  // ---- the declarative panel
+  // ---- declarative panel
   const DEMO = [
-    '# both peers start at zero and agree',
+    '# three peers, no server, no clock',
     'peer alice 0x0',
     'peer bob   0x0',
+    'peer carol 0x0',
     'link alice bob',
-    'read alice bob',
+    'read alice bob carol',
     '',
-    '# they go offline and each edit independently',
-    'offline alice',
-    'offline bob',
-    'edit alice 0x0BADF00D',
-    'edit bob   0x0BAFF00D',
-    'online alice',
+    '# carol goes offline and edits. alice and bob do not.',
+    'offline carol',
+    'edit carol 0x00000009',
+    'online carol',
+    'read alice bob carol',
     '',
-    '# one XOR: how far apart, and exactly which bytes',
-    'read alice bob',
-    '',
-    '# apply the displacement that was already measured',
-    'roll alice bob',
-    'read alice bob',
+    '# the fold IS carol. one XOR, no vote, no quorum.',
+    'roll alice bob carol',
+    'read alice bob carol',
     '',
     '# is this 0, 1, or 2?',
     'bind',
@@ -215,33 +253,54 @@
     el.log.innerHTML = '';
     let out;
     try {
-      out = declare.run(el.src.value);
+      out = D.run(el.src.value);
     } catch (e) {
-      // A line that is not properly structured is refused, with a coordinate.
       const c = e.coordinate || {};
-      sayLine(c.line || 0, 'refused', '<span class="bad">' + escapeHtml(e.message) + '</span>'
-        + (c.source ? '  <span class="ln">at: ' + escapeHtml(c.source) + '</span>' : ''), 'bad');
+      sayLine(c.line || 0, 'refused', '<span class="bad">' + esc(e.message) + '</span>'
+        + (c.source ? '  <span class="ln">at: ' + esc(c.source) + '</span>' : ''), 'bad');
       return;
     }
     for (const entry of out.log) {
       const r = entry.result;
       let body = '', cls = 'ok';
       switch (entry.op) {
-        case 'peer': body = r.name + ' seeded ' + (r.seed ? '0x' + r.seed.toString(16).toUpperCase() : '0') + '  [' + r.mode + ']'; break;
+        case 'peer': body = r.name + ' seeded ' + (r.seed ? hex(r.seed) : '0x00000000') + '  [' + r.mode + ']'; break;
         case 'link': body = r.from + ' → ' + r.to; break;
         case 'offline': case 'online': body = r.name + (r.offline ? ' offline' : ' online'); break;
         case 'edit': case 'tamper': body = r.name + ' = ' + r.hex; break;
         case 'read':
-          body = 'xor ' + (r.agreed ? '0x00000000' : r.hex) + '  popcount ' + r.popcount
-            + (r.agreed ? '  <b>AGREEMENT</b>' : '  bytes: ' + r.bytes.map((x) => x.byte + ':' + x.hex).join(' '));
-          cls = r.agreed ? 'ok' : 'warn';
+          if (r.names) {
+            // three peers: the fold is not the test, the pairwise sum is
+            body = r.agreed
+              ? 'all three agree. the fold is not the test: three copies of x fold to x, not to 0.'
+              : 'disagreement ' + r.disagreement + ' bits  residue ' + r.residue
+                + (r.hasMajority
+                  ? '  majority ' + r.majority + ' (×' + r.majorityCount + ')  <b>out: ' + r.outliers.join(', ') + '</b>'
+                  : '  <b>no majority</b>')
+                + (r.residueIsOutlier ? '  ← the fold <b>is</b> the outlier' : '');
+            cls = r.agreed ? 'ok' : 'warn';
+          } else {
+            body = 'xor ' + (r.agreed ? '0x00000000' : r.hex) + '  popcount ' + r.popcount
+              + (r.agreed ? '  <b>AGREEMENT</b>' : '  bytes: ' + r.bytes.map((x) => x.byte + ':' + x.hex).join(' '));
+            cls = r.agreed ? 'ok' : 'warn';
+          }
           break;
         case 'roll':
-          body = r.moved ? 'repaired — ' + r.before + ' → ' + r.after : (r.clobbered ? '<b>clobbered</b>, not overwritten' : 'already agreeing');
-          cls = r.moved ? 'ok' : (r.clobbered ? 'bad' : 'ok');
+          if (r.names) {
+            body = r.moved ? 'rolled ' + r.outliers.join(', ') + ' to the majority ' + r.majority + '  <b>AGREEMENT</b>'
+              : (r.noMajority
+                ? '<b>refused</b>: no majority. three-way disagreement cannot be repaired by XOR alone.'
+                : '<b>clobbered</b>, not overwritten — a peer moved between the read and the roll');
+            cls = r.moved ? 'ok' : (r.noMajority ? 'bad' : 'bad');
+          } else {
+            body = r.moved ? 'repaired — ' + r.before + ' → ' + r.after
+              : (r.clobbered ? '<b>clobbered</b>, not overwritten' : 'already agreeing');
+            cls = r.moved ? 'ok' : (r.clobbered ? 'bad' : 'ok');
+          }
           break;
         case 'witness':
-          body = r.name + '  state ' + r.state + '  fold ' + r.fold + '  steps ' + r.steps;
+          body = r.name + '  state ' + r.state + '  attested ' + r.attested + '  fold ' + r.fold
+            + (r.intact ? '' : '  <b>tampered</b>');
           cls = r.intact ? 'ok' : 'bad';
           break;
         case 'bind': body = '0, 2, 1 → centre ' + r.hex + '  is this <b>' + r.classified + '</b>?'; break;
@@ -252,57 +311,52 @@
     }
   }
 
-  function escapeHtml(s) {
-    return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-  }
-
-  // ---- wiring
+  // ---- boot
   async function boot() {
-    // peers first: declare.js requires it at module load, synchronously.
-    peers.peers = await loadModule('/shared/peers.js');
-    peers.declare = await loadModule('/shared/declare.js');
-    declare = peers.declare;
+    P = await loadModule('/shared/peers.js');
+    D = await loadModule('/shared/declare.js');
 
-    A = peers.peers.createPeer({ name: 'alice', cells: 1 });
-    B = peers.peers.createPeer({ name: 'bob', cells: 1 });
+    bindSlots();
+    for (const s of [A, B, C]) {
+      s.peer = P.createPeer({ name: { a: 'alice', b: 'bob', c: 'carol' }[s.id], cells: 1 });
+    }
 
-    el.modeLine.textContent = 'memory: ' + A.mode
-      + (A.shared ? ' — SharedArrayBuffer present, compareExchange is atomic across the peer boundary.'
-        : ' — no SharedArrayBuffer here, so compareExchange is local-only. The arithmetic is identical; the atomicity guarantee is not.');
+    ['num', 'readBox', 'outlier', 'log', 'src', 'modeLine', 'bindOut'].forEach((k) => { el[k] = $(k); });
 
-    $('btnRead').onclick = doRead;
-    $('btnRoll').onclick = doRoll;
-    $('btnWitness').onclick = doWitness;
+    el.modeLine.textContent = 'memory: ' + A.peer.mode
+      + (A.peer.shared
+        ? ' — SharedArrayBuffer present; Atomics.compareExchange is atomic across the peer boundary.'
+        : ' — no SharedArrayBuffer, so compareExchange is local-only. Same arithmetic, no atomicity guarantee.');
+
+    $('btnSplitOne').onclick = splitOne;
+    $('btnSplitAll').onclick = splitAll;
+    $('btnRoll').onclick = roll;
     $('btnBind').onclick = doBind;
-    $('btnSplit').onclick = doSplit;
     $('btnReset').onclick = doReset;
     $('btnRun').onclick = doRun;
     $('btnDemo').onclick = () => { el.src.value = DEMO; doRun(); };
 
-    for (const [box, input, off] of [[el.pA, el.eA, el.offA], [el.pB, el.eB, el.offB]]) {
-      void box;
-      input.addEventListener('change', () => {
-        const p = input === el.eA ? A : B;
-        const v = fromInput(p, input);
-        if (v === null) { input.value = hex(p.read()); return; }
-        p.write(v);
-        lastReport = null;
+    [A, B, C].forEach((s) => {
+      s.slot.input.addEventListener('change', () => {
+        const v = fromInput(s.peer, s.slot.input);
+        if (v === null) { s.slot.input.value = hex(s.peer.read()); return; }
+        s.peer.write(v);
+        lastFold = null;
         render();
       });
-      off.addEventListener('change', () => {
-        (input === el.eA ? A : B).offline = off.checked;
+      s.slot.off.addEventListener('change', () => {
+        s.peer.offline = s.slot.off.checked;
         render();
       });
-    }
+    });
 
     el.src.value = DEMO;
     render();
-    sayLine(0, 'ready', 'two peers, no server. press <b>read</b>, or <b>split them</b> then <b>roll back</b>.', 'ok');
+    sayLine(0, 'ready', 'three peers, no server. press <b>carol goes offline</b>, then <b>roll back</b>.', 'ok');
   }
 
-  let declare = null;
   boot().catch((e) => {
     document.body.insertAdjacentHTML('afterbegin',
-      '<pre style="color:#f87171;padding:20px">portal failed to boot: ' + escapeHtml(e.message) + '</pre>');
+      '<pre style="color:#f87171;padding:20px">portal failed to boot: ' + esc(e.message) + '</pre>');
   });
 })();

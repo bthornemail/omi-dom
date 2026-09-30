@@ -65,17 +65,22 @@ function preferHtml(accept) {
   return htmlQ >= sseQ;
 }
 
-function serveFile(res, filePath) {
+// NOTE: COOP + COEP are already set globally in the request handler below, so
+// every page in this server is cross-origin isolated and SharedArrayBuffer is
+// already available in the browser. The portal needs no special-casing and gets
+// none — see the "CORS + cross-origin isolation" block in createServer.
+
+function serveFile(res, filePath, extraHeaders) {
   fs.readFile(filePath, (err, data) => {
     if (err) {
       send(res, 404, { 'Content-Type': 'text/plain' }, 'Not Found');
       return;
     }
-    send(res, 200, {
+    send(res, 200, Object.assign({
       'Content-Type': contentType(filePath),
       'Cache-Control': 'no-cache',
       'Vary': 'Accept'
-    }, data);
+    }, extraHeaders || null), data);
   });
 }
 
@@ -227,6 +232,12 @@ const server = http.createServer((req, res) => {
     }
     // rare: client asked for event-stream on /
     handleSSE(req, res);
+    return;
+  }
+
+  // The front door: the two-click demo. Three peers, no server, no clock.
+  if (url.pathname === '/portal' || url.pathname === '/portal.html') {
+    serveFile(res, path.join(CLIENT, 'portal.html'));
     return;
   }
 
@@ -490,7 +501,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Shared modules (for Node workers later)
+  // Shared modules (for Node workers later, and for the browser portal)
   if (url.pathname.startsWith('/shared/')) {
     const safe = path.normalize(url.pathname).replace(/^(\.\.[/\\])+/, '');
     const filePath = path.join(ROOT, safe);

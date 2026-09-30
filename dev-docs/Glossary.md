@@ -6,6 +6,7 @@ Ordered; alphabetize when consolidating.
 ## A
 
 - **admissibility** — the structure tier of the space (`shared/space.js`). A datum is either properly structured and flows through unchanged, or it is not and `enforce` throws a `CoordinateError` carrying a structured coordinate. Admissible: a number, an `ArrayBuffer`, a typed view of 8- or 16-bit cells, or an array of numbers. There is no third option; malformed structure is neither repaired nor measured.
+- **agreement** — the state of two peers whose XOR is zero. Measurable rather than philosophical: `distance(A,B) = popcount(A XOR B)`, and distance 0 is agreement. Deliberately *not* a claim about truth — see **divergence** for what this does and does not establish.
 - **alphabet (72)** — the user character seats: 20 numeric (10 digits × high/low) + 52 letter (26 × upper/lower), the signed base-36 doubling on the two orthogonal tangent axes of 0000.
 - **algorithmic core** — `shared/algorithmic-core.js`; the one pure-function module (coordinate, subHi/subLo, fold, xorIndex, distance, is, placement, resolve, exchangeExpected) that the whole protocol resolves from; 16 self-checks, registered in `npm test` and `final-test.sh`.
 
@@ -37,6 +38,7 @@ Ordered; alphabetize when consolidating.
 
 - **C0 separator** — the four ASCII control characters 0x1C–0x1F repurposed as scope faces: BOOT0, BOOT1, SECURE, USER. They are the "why the fold is 0" constants.
 - **canonical masks** — the 13 (soon 14) fixed byte masks; the invariant reference used by both the JS protocol and the C hardware reference.
+- **clobber** — a repair that lost a race. `repair(a, b, report)` checks its exchange against the state the *report* observed, so a peer that moved between the read and the roll is reported as `clobbered: true` and the write is not overwritten. Checking against a fresh read would always succeed and would silently clobber — a real bug found by the self-test in `shared/peers.js`.
 - **closure** — the property that XOR-ing the four face masks gives 0x0000; "0 is the only truth".
 - **cone lattice** — the Steiner-triple cone geometry: vertices on a cone, edges are Steiner triples; the substrate of `/universe` and `/agent/world`.
 - **CoordinateError** — the structured exception of the space (`shared/space.js`). Thrown when a datum is *not* properly structured. It is a real `Error`, so `catch` works and the stack survives, and it carries a proper structured coordinate (`x`, `y`, `pin`, `binding`, `application`, `evaluation`, plus byte offsets when a view was given) as data rather than folded into a string. Distinct from a value mismatch, which is measured and never thrown — see **admissibility** and **exchange**.
@@ -44,10 +46,12 @@ Ordered; alphabetize when consolidating.
 
 ## D
 
+- **declarative syntax** — `shared/declare.js`. It declares *arrangements, not meanings*: each line names peers and says which comparison to run, and nothing in it assigns a value to a point or an order to two edits. That is the user's, and the file declines to do it. A line that is not properly structured is refused with a `DeclarationError` carrying the 1-based line number; a line that merely disagrees is a reading, never a refusal. A number reads the same in all four radices — `0xF`, `0b1111`, `0o17`, `0d15`.
 - **delta rolling law** — the fixed-point rotation applied to a word each epoch; `a ^ b ^ b == a`, i.e. XOR as its own inverse, so nothing is ever destroyed.
 - **distance** — `popcount(a ^ b)` on the 16-bit word; the only metric the protocol tracks; `is` = distance == 0, the protocol's only truth.
 - **digest** — the final phase of the protocol; the 10T XOR realization; folds the full stream into one word (USER).
 - **dimension-pipeline** — the module that lifts a vector of words through spatial dimensions using XOR only. Interpretation: each dimension is the **dimension of the index** (the rank of one index), not a count of memory layers.
+- **divergence** — the difference between two peer states, as magnitude and never as order. `shared/peers.js`. Because XOR is commutative (`a^b == b^a`) it cannot tell you which of two concurrent edits came first, so it is not a vector clock or a Lamport clock. What it gives instead: how far apart two states are, which bytes, and how to undo it, with no server and no clock.
 - **exchangeExpected** — the pure model of `Atomics.compareExchange`: returns `{was, now, matched}` — swap if the cell `is` expected, else return what it actually is (the discrepancy); no write, no mutation.
 - **foldWord** — the fold of the coordinate: `subHi(w) ^ subLo(w)`, collapsing the 16-bit word to an 8-bit reading; equal halves fold to the pinch 0x00.
 
@@ -105,6 +109,7 @@ Ordered; alphabetize when consolidating.
 - **OMO** — "Ordo Mundus Omicron" (order + world + the glyph glyph); the same reduction as IMO called from the other side.
 - **IMPORTANT (IMO)** — "Iter Mater Ordo" (way, matter, order): the transmutation that a stream (the way) of matter (bytes) passes through to find its order.
 - **order** — the third of IMO/OMO: the fold 0x0000 the whole protocol cycles toward.
+- **outlier** — the peer not in the majority, identified by `fold3` in `shared/peers.js`. With three peers holding two distinct values, the value held by two is the majority and the third peer is the outlier; the residue equals the outlier's value. With three distinct values there is no majority, so the outlier is undefined and `reconcile3` refuses rather than picking a winner.
 
 ## P
 
@@ -120,6 +125,8 @@ Ordered; alphabetize when consolidating.
 
 ## R
 
+- **reconcile3** — bring three peers to agreement by rolling every outlier to the majority value through its own sanctioned `applyCas` gate, so the witness advances and a legitimate repair is never mistaken for a tamper. Takes the report the user was shown and reports a clobber rather than overwriting a peer that moved in between. Returns `stalled: true` when there is no majority to roll toward.
+- **residue** — the XOR of all three peer values, `a ^ b ^ c`, in `shared/peers.js`. It is **not** the agreement test: three copies of `x` fold to `x`, not zero, because three is odd. Agreement is measured pairwise. What the residue *is* good for is naming the dissenter — if two peers agree and one does not, the residue is exactly the outlier's value, so one XOR identifies who diverged with no vote, no quorum and nothing to elect.
 - **ruler** — the 16-bit coordinate ruler; `ruler.js` = the protocol core (bind/apply/eval/digest + bind symmetry, apply compareExchange semantics, eval extraction, digest F-mean + XOR fold, iff, XOR ruler identity/involution).
 - **rung** — one step of the ladder: `{rung, mask, state, parity}`; the SSE stream steps through 13 rungs repeatedly.
 - **run-GNN / spatial-gnn** — the spatial graph-neural pass over the Steiner cone.
@@ -137,6 +144,7 @@ Ordered; alphabetize when consolidating.
 
 ## T
 
+- **tamper evidence** — a consequence of state being a single word. A peer keeps the XOR-fold of everything it has published; an honest write advances the fold, a write from behind the peer's back does not, so the two disagree and the tampering shows. Not a security primitive — a free consequence of the representation.
 - **transistor XOR** — the 5T/6T/8T/10T real-world XOR gates (Cody Wabiszewski breadboards) each face is named after.
 - **transmutation** — the lossless transformation proof (`test/transmute.test.js`): audio/video bytes transmute through worker threads and are proven lossless.
 

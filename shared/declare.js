@@ -19,8 +19,14 @@
  *     online  alice                put it back on the path
  *     read   alice bob             one XOR: how far apart, and where
  *     roll   alice bob             apply the displacement already measured
+ *     read   alice bob carol       three peers: the fold IS the outlier
+ *     roll   alice bob carol       roll every outlier to the majority
  *     witness alice                has this peer been tampered with?
  *     bind                         0, 2, 1 — is this 0, 1, or 2?
+ *
+ * `read` and `roll` take two or three peers. With two you get magnitude and
+ * displacement. With three, when two agree and one does not, the XOR of all
+ * three IS the outlier's value — so the same single XOR names the dissenter.
  *
  * Two tiers, the same discipline as the space: a line that is not properly
  * structured is refused with a structured error carrying the line number. A
@@ -52,6 +58,10 @@ const OPS = Object.freeze({
   read: 2, roll: 2, witness: 1, bind: 0, reset: 0,
 });
 
+// Maximum arity, where a declaration is a count of peers rather than a list.
+// Unbounded elsewhere, so `peer name seed` keeps working.
+const MAX_OPS = Object.freeze({ read: 3, roll: 3 });
+
 // One line into its parts. Words and a 0x-prefixed or bare number.
 function parseLine(raw, n) {
   const text = String(raw).split('#')[0].trim();
@@ -65,6 +75,10 @@ function parseLine(raw, n) {
   const args = parts.slice(1);
   if (args.length < arity) {
     throw new DeclarationError(n, op + ' needs ' + arity + ' argument' + (arity === 1 ? '' : 's'), raw);
+  }
+  const max = MAX_OPS[op];
+  if (max !== undefined && args.length > max) {
+    throw new DeclarationError(n, op + ' takes at most ' + max + ' peers, got ' + args.length, raw);
   }
   return { op, args, line: n, raw: text };
 }
@@ -147,8 +161,30 @@ function run(source, opts) {
         break;
       }
       case 'read': {
-        const a = need(world.peers, String(args[0]), line);
-        const b = need(world.peers, String(args[1]), line);
+        const named = args.map((x) => need(world.peers, String(x), line));
+        if (named.length === 3) {
+          const [a, b, c] = named;
+          const report = peers.fold3(a, b, c);
+          // Stash it on all three, keyed by who was read together, so a later
+          // `roll a b c` acts on the report the user was actually looking at.
+          const tag = { names: [b.name, c.name], report };
+          a._last3 = tag; b._last3 = tag; c._last3 = tag;
+          emit(line, op, {
+            names: [a.name, b.name, c.name],
+            agreed: report.agreed,
+            disagreement: report.disagreement,
+            residue: peers.hex32(report.residue),
+            hasMajority: report.hasMajority,
+            majority: report.hasMajority ? peers.hex32(report.majority) : null,
+            majorityCount: report.majorityCount,
+            outliers: report.outliers,
+            // Stated, not assumed: this only holds with exactly one outlier.
+            residueIsOutlier: report.residueIsOutlier,
+            pairs: report.pairs,
+          });
+          break;
+        }
+        const [a, b] = named;
         const report = peers.divergence(a, b);
         // Stash it on the pair so a later `roll` acts on the report the user
         // was actually looking at, not a fresh one.
@@ -164,8 +200,28 @@ function run(source, opts) {
         break;
       }
       case 'roll': {
-        const a = need(world.peers, String(args[0]), line);
-        const b = need(world.peers, String(args[1]), line);
+        const named = args.map((x) => need(world.peers, String(x), line));
+        if (named.length === 3) {
+          const [a, b, c] = named;
+          const stale = (a._last3 && a._last3.names[0] === b.name && a._last3.names[1] === c.name)
+            ? a._last3.report : null;
+          const r = peers.reconcile3(a, b, c, stale);
+          for (const p of named) p._last3 = null;
+          // Two very different refusals that both leave the peers alone, and
+          // must not be reported as the same thing: nobody is in a majority, or
+          // the user acted on a report that has since been overtaken.
+          const noMajority = !r.fold.hasMajority;
+          emit(line, op, {
+            names: [a.name, b.name, c.name],
+            moved: r.moved,
+            noMajority,
+            clobbered: r.stalled && !noMajority,
+            majority: r.fold.hasMajority ? peers.hex32(r.fold.majority) : null,
+            outliers: r.fold.outliers,
+          });
+          break;
+        }
+        const [a, b] = named;
         const stale = (a._last && a._last.b === b.name) ? a._last.report : null;
         const r = peers.repair(a, b, stale);
         a._last = null; b._last = null;
@@ -179,13 +235,15 @@ function run(source, opts) {
       case 'witness': {
         const p = need(world.peers, String(args[0]), line);
         const w = p.witness();
-        // The tripwire: state that no longer sits at the fold of what the peer
-        // published is state somebody changed behind its back.
-        const intact = w.steps === 0 ? w.state === 0 : true;
+        // intact is exact: it asks whether the current state is the one the
+        // peer last published through its own gate. The fold is displayed as
+        // an invariant, never used as the check — after two honest writes the
+        // fold is a^b, which is not the state, and nothing is wrong.
         emit(line, op, {
           name: p.name, steps: w.steps,
           state: peers.hex32(w.state), fold: peers.hex32(w.fold),
-          intact,
+          attested: peers.hex32(w.attested),
+          intact: w.intact,
         });
         break;
       }
@@ -283,12 +341,81 @@ function selfTest() {
   const w = run('peer t 0x0\nedit t 0x1111\nwitness t');
   assert('an honest peer witnesses its own history', w.log[2].result.intact === true);
   const w2 = run('peer t 0x0\nedit t 0x1111\ntamper t 0x2222\nwitness t');
-  assert('a tampered peer is reported', w2.log[3].result.state !== w2.log[3].result.fold);
+  assert('a tampered peer is reported', w2.log[3].result.intact === false);
+  const w3 = run('peer t 0x0\nedit t 0x1111\nedit t 0x3333\nwitness t');
+  assert('two honest writes are NOT tampering, even though fold != state',
+    w3.log[3].result.intact === true && w3.log[3].result.fold !== w3.log[3].result.state);
+  const w4 = run('peer x 0x0\npeer y 0x0\nedit x 0xBADF00D\nedit y 3\nread x y\nroll x y\nwitness y');
+  assert('a repaired peer witnesses clean, not as a tamper', w4.log[6].result.intact === true);
 
   // --- bind
   const bd = run('peer x 0x0\npeer y 0x0\nlink x y\nbind');
   assert('the bind declares the literal cycle 0, 2, 1', bd.log[3].result.order.join(',') === '0,2,1');
   assert('the bind classifies into exactly three possibilities', [0, 1, 2].includes(bd.log[3].result.classified));
+
+  // Look declarations up by what they ARE, not by line number. Indexing a log
+  // by position breaks the moment a line is inserted, and then the test is
+  // asserting about the wrong declaration rather than failing loudly.
+  const nth = (out, op, n) => out.log.filter((e) => e.op === op)[n].result;
+
+  // --- three peers: the fold names the outlier
+  const tri = run([
+    'peer alice 0x0', 'peer bob 0x0', 'peer carol 0x0',
+    'link alice bob',
+    'read alice bob carol',
+    'offline carol',
+    'edit carol 0x00000009',
+    'online carol',
+    'read alice bob carol',
+    'roll alice bob carol',
+    'read alice bob carol',
+  ].join('\n'));
+  assert('three peers all zero agree', nth(tri, 'read', 0).agreed === true);
+  assert('the residue of three equal values is NOT the agreement test',
+    nth(tri, 'read', 0).residue === '0x00000000' || nth(tri, 'read', 0).disagreement === 0);
+  assert('a three-way read reports one outlier', nth(tri, 'read', 1).outliers.length === 1
+    && nth(tri, 'read', 1).outliers[0] === 'c');
+  assert('the residue IS the outlier value when exactly one diverges',
+    nth(tri, 'read', 1).residueIsOutlier === true
+    && nth(tri, 'read', 1).residue === peers.hex32(0x9));
+  assert('the three-way roll repaired it', nth(tri, 'roll', 0).moved === true);
+  assert('they agree afterwards', nth(tri, 'read', 2).agreed === true);
+
+  // the trap, stated as a test: 5^5^5 is nonzero yet they all agree
+  const odd = run('peer a 5\npeer b 5\npeer c 5\nread a b c');
+  const oddr = nth(odd, 'read', 0);
+  assert('three copies of x fold to x, not to zero',
+    oddr.residue === '0x00000005' && oddr.agreed === true && oddr.disagreement === 0);
+
+  // no majority: refused, and it must not invent a winner
+  const none = run([
+    'peer a 1', 'peer b 2', 'peer c 4',
+    'read a b c',
+    'roll a b c',
+  ].join('\n'));
+  assert('a three-way split reports no majority', nth(none, 'read', 0).hasMajority === false);
+  assert('a three-way split still measures disagreement', nth(none, 'read', 0).disagreement > 0);
+  assert('a three-way roll refuses instead of picking a winner', nth(none, 'roll', 0).moved === false
+    && nth(none, 'roll', 0).noMajority === true);
+  assert('the refusal is reported as no-majority, not as a clobber',
+    nth(none, 'roll', 0).clobbered === false);
+
+  // a stale three-peer report
+  const stale3 = run([
+    'peer a 0x0', 'peer b 0x0', 'peer c 0x0',
+    'edit a 7', 'edit b 7', 'edit c 9',
+    'read a b c',
+    'edit c 3',
+    'roll a b c',
+  ].join('\n'));
+  assert('a stale three-peer roll reports a clobber instead of lying',
+    nth(stale3, 'roll', 0).clobbered === true && nth(stale3, 'roll', 0).noMajority === false);
+  assert('the overtaken peer is not overwritten', stale3.peers.c.read() === 3);
+
+  assert('four peers is refused as a structural error', (function () {
+    try { run('peer a 0\npeer b 0\npeer c 0\npeer d 0\nread a b c d'); return false; }
+    catch (e) { return e instanceof DeclarationError && /at most 3 peers/.test(e.message); }
+  })());
 
   const failed = results.filter(r => !r.pass);
   return { passed: failed.length === 0, total: results.length, failed: failed.length, results };

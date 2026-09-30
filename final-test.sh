@@ -47,7 +47,7 @@ sleep 1
 cleanup() { kill $SPID 2>/dev/null || true; }
 trap cleanup EXIT
 
-for path in / /adopt /genesis /genesis-fold /api/pipeline /api/bundle /docs/README.md \
+for path in / /portal /adopt /genesis /genesis-fold /api/pipeline /api/bundle /docs/README.md \
   /wiki /api/wiki /wiki/index.json /wiki/chapters/cn-02-apply-6t.json /wiki/chapters/cn-04-digest-10t.json \
   /api/substrate /universe /devtools /agent /agent/world /api/cues; do
   code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${PORT}${path}" || echo 000)
