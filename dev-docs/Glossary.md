@@ -145,6 +145,7 @@ Ordered; alphabetize when consolidating.
 ## T
 
 - **tamper evidence** — a consequence of state being a single word. A peer keeps the XOR-fold of everything it has published; an honest write advances the fold, a write from behind the peer's back does not, so the two disagree and the tampering shows. Not a security primitive — a free consequence of the representation.
+- **tier 1 / tier 2 (the two tiers)** — the protocol's only two error behaviours, and the line between them is **whether the question was well posed**, not whether the caller likes the answer. *Tier 1, value:* a well-formed request that disagrees — `rebase('0x',16,'0d')` answering `10` vs `16`, a non-closing `Q` pair, `pin(0x10,...)` answering `inRange: false`. These are readings: reported, measured, never refused. *Tier 2, structure:* a request with no answer at all — `partitionByName('0q')` (only four partitions exist), `cycleIndex('0x',16)` (the slot space ends at `0xF`), `compareExchange('a',1,2)` (that is not a cell). These throw `CoordinateError` carrying `.coordinate`. A disagreement is not a rejection; a reference to nothing is not a reading.
 - **transistor XOR** — the 5T/6T/8T/10T real-world XOR gates (Cody Wabiszewski breadboards) each face is named after.
 - **transmutation** — the lossless transformation proof (`test/transmute.test.js`): audio/video bytes transmute through worker threads and are proven lossless.
 
