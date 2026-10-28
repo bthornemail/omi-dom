@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>OMI Circuit Walkthrough</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 1.5rem; max-width: 52rem; }
+    #schematic { border: 1px solid #ccc; border-radius: 8px; min-height: 280px; margin: 1rem 0; }
+    #log { white-space: pre-wrap; background: #111; color: #cfc; padding: 1rem; border-radius: 8px; font-size: 13px; }
+    button { margin-right: 0.5rem; padding: 0.4rem 0.8rem; }
+    .active { outline: 2px solid #06c; }
+    h1 { font-size: 1.25rem; }
+    .note { color: #555; font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+  <h1>Simulated spectral circuit walkthrough</h1>
+  <p class="note">Platform-agnostic VTT spool + DOM nodes + BusyBox-style applets.
+    Educational / pseudo-persistent — not a real RF transmitter.</p>
+  <div>
+    <button id="prev">Prev</button>
+    <button id="next">Next</button>
+    <button id="run">Run applet</button>
+    <span id="status"></span>
+  </div>
+  <div id="schematic"></div>
+  <div id="log"></div>
+  <audio id="media" controls style="width:100%;margin-top:1rem"></audio>
+  <script type="module">
+    // Inline minimal port of createWalkthrough for browser (no require)
+    const LESSONS = [
+      { id:'boot', title:'Boot the bus', applet:'echo', duration:2, narrative:'3! streams. No hardware required.', node:{ id:'bus', kind:'bus', label:'3! bus' } },
+      { id:'xor-gate', title:'Place XOR gate', applet:'xor', duration:2.5, narrative:'Everything reduces to XOR.', node:{ id:'xor1', kind:'gate', label:'XOR', op:'xor' } },
+      { id:'fano-tick', title:'Fano tick (−7D)', applet:'probe', duration:3, narrative:'Phase mod 7 before 8D.', node:{ id:'fano', kind:'constraint', label:'Fano −7D' } },
+      { id:'e8-shell', title:'E₈ shell (240)', applet:'connect', duration:3, narrative:'240 roots ↔ 240-clock.', node:{ id:'e8', kind:'shell', label:'E₈ 240' } },
+      { id:'observer', title:'Observer @ 0D', applet:'probe', duration:2.5, narrative:'Centroid 0x0000.', node:{ id:'obs', kind:'observer', label:'0x0000' } },
+      { id:'persist', title:'Witness & share', applet:'digest', duration:2, narrative:'Pseudo-persist the schematic.', node:{ id:'wit', kind:'witness', label:'witness' } }
+    ];
+
+    function runApplet(applet) {
+      if (applet === 'xor') return { ok:true, out: 0x0f ^ 0xf0 };
+      if (applet === 'digest') {
+        let h = 0;
+        const s = LESSONS.map(L => L.id).join('|');
+        for (let i = 0; i < s.length; i++) h = (h ^ s.charCodeAt(i)) & 0xffff;
+        return { ok:true, out: '0x' + h.toString(16).padStart(4,'0') };
+      }
+      if (applet === 'echo') return { ok:true, out: 'bus ready' };
+      if (applet === 'connect') return { ok:true, out: 'link fano → e8' };
+      return { ok:true, out: { centroid: '0x0000' } };
+    }
+
+    function buildSchematic() {
+      return LESSONS.map((L, i) => {
+        const x = 40 + (i % 3) * 120;
+        const y = 40 + Math.floor(i / 3) * 100;
+        return `<div id="${L.node.id}" class="omi-circuit-node" data-step="${i}" style="position:absolute;left:${x}px;top:${y}px;min-width:96px;padding:8px;border:1px solid #888;border-radius:6px;">
+          <strong>${L.node.label}</strong><br><small>${L.applet}</small></div>`;
+      }).join('');
+    }
+
+    function cuesToVtt() {
+      let t = 0, body = 'WEBVTT\n\n';
+      LESSONS.forEach((L, i) => {
+        const start = t, end = t + L.duration; t = end;
+        const pad = (n,w=2) => String(n).padStart(w,'0');
+        const fmt = (s) => {
+          const h=Math.floor(s/3600), m=Math.floor((s%3600)/60), sec=s%60;
+          const whole=Math.floor(sec), ms=Math.round((sec-whole)*1000);
+          return `${pad(h)}:${pad(m)}:${pad(whole)}.${pad(ms,3)}`;
+        };
+        body += `${i+1}\n${fmt(start)} --> ${fmt(end)}\n${JSON.stringify({ id:L.id, title:L.title, applet:L.applet, narrative:L.narrative })}\n\n`;
+      });
+      return body;
+    }
+
+    let step = 0;
+    const schematic = document.getElementById('schematic');
+    const log = document.getElementById('log');
+    const status = document.getElementById('status');
+    schematic.style.position = 'relative';
+    schematic.innerHTML = buildSchematic();
+
+    function show() {
+      const L = LESSONS[step];
+      status.textContent = `Step ${step+1}/${LESSONS.length}: ${L.title}`;
+      document.querySelectorAll('.omi-circuit-node').forEach((el, i) => {
+        el.classList.toggle('active', i === step);
+      });
+      log.textContent = L.narrative + '\n\n' + JSON.stringify(runApplet(L.applet), null, 2);
+      try { localStorage.setItem('omi-circuit-step', String(step)); } catch (_) {}
+    }
+
+    document.getElementById('prev').onclick = () => { step = Math.max(0, step - 1); show(); };
+    document.getElementById('next').onclick = () => { step = Math.min(LESSONS.length - 1, step + 1); show(); };
+    document.getElementById('run').onclick = () => show();
+
+    // VTT blob on silent audio for native TextTrack timing (optional)
+    const media = document.getElementById('media');
+    const blob = new Blob([cuesToVtt()], { type: 'text/vtt' });
+    const url = URL.createObjectURL(blob);
+    const track = document.createElement('track');
+    track.kind = 'metadata'; track.label = 'circuit'; track.src = url; track.default = true;
+    media.appendChild(track);
+    // silent short wav optional — user can advance manually
+
+    try {
+      const saved = localStorage.getItem('omi-circuit-step');
+      if (saved != null) step = Math.min(LESSONS.length - 1, parseInt(saved, 10) || 0);
+    } catch (_) {}
+    show();
+  </script>
+</body>
+</html>
